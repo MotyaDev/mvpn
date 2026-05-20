@@ -52,6 +52,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,16 +64,20 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.motya.mvpn.core.XrayCore
 import com.motya.mvpn.core.ConnectionState
 import com.motya.mvpn.core.VpnStatus
 import com.motya.mvpn.data.ProfileStore
+import com.motya.mvpn.data.SubscriptionUpdater
 import com.motya.mvpn.data.VlessParser
 import com.motya.mvpn.data.VlessProfile
 import com.motya.mvpn.service.MvpnVpnService
 import com.motya.mvpn.ui.theme.MvpnTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,27 +87,64 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-class MainViewModel(private val store: ProfileStore) : ViewModel() {
+class MainViewModel(private val context: Context, private val store: ProfileStore) : ViewModel() {
     private val _profiles = MutableStateFlow(store.load())
     val profiles = _profiles.asStateFlow()
 
+    private val _subscriptions = MutableStateFlow(store.loadSubscriptions())
+    val subscriptions = _subscriptions.asStateFlow()
+
+    private val _pings = MutableStateFlow<Map<String, String>>(emptyMap())
+    val pings = _pings.asStateFlow()
+
     fun add(raw: String): Result<Unit> = runCatching {
         val profile = VlessParser.parse(raw)
-        val updated = (_profiles.value.filterNot { it.id == profile.id && it.host == profile.host } + profile)
-        _profiles.value = updated
-        store.save(updated)
+        setProfiles(_profiles.value.mergeProfiles(listOf(profile)))
     }
 
-    fun remove(profile: VlessProfile) {
-        val updated = _profiles.value - profile
-        _profiles.value = updated
-        store.save(updated)
+    fun addSubscription(url: String): Result<Unit> = runCatching {
+        require(url.startsWith("http://") || url.startsWith("https://")) { "Нужна http(s)-ссылка подписки" }
+        val updated = (_subscriptions.value + url.trim()).distinct()
+        _subscriptions.value = updated
+        store.saveSubscriptions(updated)
     }
+
+    fun refreshSubscriptions(): Result<Int> = runCatching {
+        val fetched = _subscriptions.value.flatMap { SubscriptionUpdater.fetch(it) }
+        setProfiles(_profiles.value.mergeProfiles(fetched))
+        store.markSubscriptionsUpdated()
+        fetched.size
+    }
+
+    fun shouldAutoRefreshSubscriptions(): Boolean {
+        val day = 24L * 60L * 60L * 1000L
+        return _subscriptions.value.isNotEmpty() && System.currentTimeMillis() - store.lastSubscriptionUpdate() > day
+    }
+
+    fun setPing(profile: VlessProfile, value: String) {
+        _pings.value = _pings.value + (profile.key() to value)
+    }
+
+    fun ping(profile: VlessProfile): Result<Long> = runCatching { XrayCore.measureOutboundDelay(context, profile) }
+
+    fun remove(profile: VlessProfile) {
+        setProfiles(_profiles.value - profile)
+    }
+
+    private fun setProfiles(items: List<VlessProfile>) {
+        _profiles.value = items
+        store.save(items)
+    }
+
+    private fun List<VlessProfile>.mergeProfiles(newItems: List<VlessProfile>): List<VlessProfile> =
+        (this + newItems).distinctBy { it.key() }
+
+    fun VlessProfile.key(): String = "$id@$host:$port"
 }
 
 class MainViewModelFactory(private val context: Context) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
-    override fun <T : ViewModel> create(modelClass: Class<T>): T = MainViewModel(ProfileStore(context.applicationContext)) as T
+    override fun <T : ViewModel> create(modelClass: Class<T>): T = MainViewModel(context.applicationContext, ProfileStore(context.applicationContext)) as T
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -111,8 +153,11 @@ fun MvpnApp() {
     val context = LocalContext.current
     val model: MainViewModel = viewModel(factory = MainViewModelFactory(context))
     val profiles by model.profiles.collectAsState()
+    val subscriptions by model.subscriptions.collectAsState()
+    val pings by model.pings.collectAsState()
     val vpnState by VpnStatus.state.collectAsState()
     val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
     var selected by remember(profiles) { mutableStateOf(profiles.firstOrNull()) }
     var dialogOpen by remember { mutableStateOf(false) }
     var pendingStart by remember { mutableStateOf<VlessProfile?>(null) }
@@ -126,6 +171,9 @@ fun MvpnApp() {
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (model.shouldAutoRefreshSubscriptions()) {
+            withContext(Dispatchers.IO) { model.refreshSubscriptions() }
         }
     }
 
@@ -182,6 +230,20 @@ fun MvpnApp() {
             }
 
 
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    FilledTonalButton(onClick = {
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { model.refreshSubscriptions() }
+                            snackbar.showMessage(result.fold({ "Обновлено серверов: $it" }, { it.message.orEmpty() }))
+                        }
+                    }, enabled = subscriptions.isNotEmpty()) {
+                        Text("Обновить подписки")
+                    }
+                    Text("Подписок: ${subscriptions.size}", modifier = Modifier.align(Alignment.CenterVertically))
+                }
+            }
+
             if (profiles.isEmpty()) {
                 item {
                     EmptyCard(onPaste = {
@@ -195,7 +257,15 @@ fun MvpnApp() {
                     ProfileCard(
                         profile = profile,
                         selected = profile == selected,
+                        ping = pings[with(model) { profile.key() }],
                         onClick = { selected = profile },
+                        onPing = {
+                            model.setPing(profile, "…")
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { model.ping(profile) }
+                                model.setPing(profile, result.fold({ "${it} ms" }, { "ошибка" }))
+                            }
+                        },
                         onDelete = { model.remove(profile) },
                     )
                 }
@@ -207,9 +277,22 @@ fun MvpnApp() {
         AddProfileDialog(
             onDismiss = { dialogOpen = false },
             onAdd = { raw ->
-                model.add(raw)
-                    .onSuccess { dialogOpen = false }
-                    .onFailure { snackbar.showMessage(it.message.orEmpty()) }
+                val text = raw.trim()
+                if (text.startsWith("http://") || text.startsWith("https://")) {
+                    model.addSubscription(text)
+                        .onSuccess {
+                            dialogOpen = false
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { model.refreshSubscriptions() }
+                                snackbar.showMessage(result.fold({ "Обновлено серверов: $it" }, { it.message.orEmpty() }))
+                            }
+                        }
+                        .onFailure { snackbar.showMessage(it.message.orEmpty()) }
+                } else {
+                    model.add(text)
+                        .onSuccess { dialogOpen = false }
+                        .onFailure { snackbar.showMessage(it.message.orEmpty()) }
+                }
             },
             onPaste = { pasteVless(context).orEmpty() },
         )
@@ -259,7 +342,7 @@ private fun EmptyCard(onPaste: () -> Unit) {
 }
 
 @Composable
-private fun ProfileCard(profile: VlessProfile, selected: Boolean, onClick: () -> Unit, onDelete: () -> Unit) {
+private fun ProfileCard(profile: VlessProfile, selected: Boolean, ping: String?, onClick: () -> Unit, onPing: () -> Unit, onDelete: () -> Unit) {
     Card(
         onClick = onClick,
         shape = RoundedCornerShape(24.dp),
@@ -271,8 +354,9 @@ private fun ProfileCard(profile: VlessProfile, selected: Boolean, onClick: () ->
             Column(Modifier.weight(1f)) {
                 Text(profile.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text("${profile.host}:${profile.port}", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${profile.security.uppercase()} · ${profile.transport}", style = MaterialTheme.typography.labelMedium)
+                Text("${profile.security.uppercase()} · ${profile.transport}${ping?.let { " · $it" }.orEmpty()}", style = MaterialTheme.typography.labelMedium)
             }
+            FilledTonalButton(onClick = onPing) { Text("Пинг") }
             IconButton(onClick = onDelete) { Icon(Icons.Rounded.Delete, contentDescription = "Удалить") }
         }
     }
@@ -283,14 +367,14 @@ private fun AddProfileDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit, onP
     var text by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Добавить VLESS") },
+        title = { Text("Добавить VLESS / подписку") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
                     minLines = 4,
-                    label = { Text("vless://…") },
+                    label = { Text("vless://… или https://…") },
                     modifier = Modifier.fillMaxWidth(),
                 )
                 FilledTonalButton(onClick = { text = onPaste() }, modifier = Modifier.fillMaxWidth()) {

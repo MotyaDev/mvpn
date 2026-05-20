@@ -60,7 +60,7 @@ class MvpnVpnService : VpnService() {
             XrayCore.init(this)
 
             tun?.close()
-            tun = Builder()
+            val builder = Builder()
                 .setSession("MVPN")
                 .setMtu(1500)
                 .addAddress("172.19.0.1", 30)
@@ -69,7 +69,8 @@ class MvpnVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .allowFamily(android.system.OsConstants.AF_INET)
                 .setBlocking(false)
-                .establish() ?: error("Не удалось создать TUN-интерфейс")
+            runCatching { builder.addDisallowedApplication(packageName) }
+            tun = builder.establish() ?: error("Не удалось создать TUN-интерфейс")
 
             startForeground(NOTIFICATION_ID, notification("MVPN подключается", profile.name))
             XrayCore.start(config, tun!!.fd)

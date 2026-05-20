@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GRADLE_OPTS: -Xmx1024m -Dfile.encoding=UTF-8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,11 +30,9 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.10.2
 
       - name: Build release APK
-        run: gradle assembleRelease
+        run: ./gradlew assembleRelease --no-daemon --max-workers=1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
