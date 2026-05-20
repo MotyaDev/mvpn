@@ -10,6 +10,7 @@ import libv2ray.Libv2ray
 import libv2ray.ProcessFinder
 import java.io.File
 import java.net.InetSocketAddress
+import com.motya.mvpn.data.VlessProfile
 
 object XrayCore {
     private val controller: CoreController by lazy { Libv2ray.newCoreController(Callback()) }
@@ -46,6 +47,11 @@ object XrayCore {
     }
 
     fun traffic(): Pair<Long, Long> = controller.queryStats("proxy", "uplink") to controller.queryStats("proxy", "downlink")
+
+    fun measureOutboundDelay(context: Context, profile: VlessProfile): Long {
+        init(context)
+        return Libv2ray.measureOutboundDelay(XrayConfigFactory.buildPing(profile), "https://www.google.com/generate_204")
+    }
 
     private class Callback : CoreCallbackHandler {
         override fun startup(): Long = 0
